@@ -1,3 +1,5 @@
+use std::slice;
+
 use aead::{AeadCore, AeadInOut, Key, KeyInit, KeySizeUser, Nonce, inout::InOutBuf};
 use cipher::{BlockSizeUser, ParBlocksSizeUser, typenum::Unsigned};
 use digest::{
@@ -160,7 +162,8 @@ impl OutputSizeUser for HiAeMac {
 impl FixedOutput for HiAeMac {
     fn finalize_into(mut self, out: &mut digest::Output<Self>) {
         if self.blocks.get_pos() > 0 {
-            self.state.absorb_buf(&self.blocks.pad_with_zeros());
+            self.state
+                .absorb_blocks(slice::from_ref(&self.blocks.pad_with_zeros()));
         }
         *out = self.state.finalize(self.data_len_bits, 0).into()
     }

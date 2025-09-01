@@ -1,8 +1,8 @@
 use std::arch::x86_64::*;
-use std::ops::{BitAnd, BitXor};
+use std::ops::{BitAnd, BitXor, BitXorAssign};
 
 use hybrid_array::Array;
-use hybrid_array::sizes::{U1, U16, U32};
+use hybrid_array::sizes::U16;
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -36,7 +36,7 @@ impl AesBlock {
     }
 
     #[inline(always)]
-    pub fn from_block(a: &Array<u8, Self::Block>) -> Self {
+    pub fn from_block(a: &Array<u8, U16>) -> Self {
         // Safety: both types are equivalent, and transmute does not care about alignment.
         AesBlock(unsafe { core::mem::transmute::<[u8; 16], __m128i>(a.0) })
     }

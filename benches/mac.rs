@@ -19,8 +19,28 @@ fn hiae_cl(b: Bencher) {
     let key = [0u8; 32];
 
     b.counter(BytesCount::of_slice(&m)).bench_local(|| {
-        let mut state = HiAeMac::new(&black_box(key).into(), &[0u8; 16].into());
+        let mut state = HiAeMac::new(&black_box(key).into(), &black_box([0u8; 16].into()));
         state.update(black_box(&m));
-        black_box(state.finalize());
+        state.finalize()
+    });
+}
+
+#[divan::bench]
+fn hiae_cl_aead(b: Bencher) {
+    use aead::{AeadInOut, KeyInit, inout::InOutBuf};
+    use hiae_cl::HiAe;
+
+    let m = vec![0xd0u8; 65536];
+    let key = [0u8; 32];
+
+    b.counter(BytesCount::of_slice(&m)).bench_local(|| {
+        let state = HiAe::new(&black_box(key).into());
+        state
+            .encrypt_inout_detached(
+                &black_box([0u8; 16].into()),
+                black_box(&m),
+                InOutBuf::from(&mut [][..]),
+            )
+            .unwrap()
     });
 }

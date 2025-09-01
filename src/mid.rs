@@ -1,4 +1,7 @@
-use std::ops::{Index, IndexMut, ShlAssign};
+use std::{
+    ops::{Index, IndexMut, ShlAssign},
+    slice,
+};
 
 use crate::low::AesBlock;
 
@@ -146,13 +149,12 @@ macro_rules! chunked {
             i = 16;
         }
 
-        let mut i = Buffer::len(&$chunks);
+        let n = Buffer::len(&$chunks);
         let mut batch = $chunks;
-        let n = i;
-        duff16!(i, {
-            let $block = Buffer::get(&mut batch, n - i);
+        for i in 0..n {
+            let $block = Buffer::get(&mut batch, i);
             $expr;
-        });
+        }
     }};
 }
 
@@ -248,6 +250,11 @@ impl HiAeCore {
     }
 
     #[inline(never)]
+    fn encrypt_blocks(&mut self, mut chunks: InOutBuf<'_, '_, Array<u8, U16>>) {
+        chunked!(self, chunks, |b| self.encrypt_block(b))
+    }
+
+    #[inline(always)]
     pub fn encrypt_buf(&mut self, buf: InOutBuf<'_, '_, u8>) {
         let (chunks, tail) = buf.into_chunks();
 
@@ -256,14 +263,9 @@ impl HiAeCore {
             let len = tail.len();
             let mut msg_chunk = Array::default();
             msg_chunk[..len].copy_from_slice(tail.get_in());
-            self.encrypt_block(InOut::from(&mut msg_chunk));
+            self.encrypt_blocks(InOutBuf::from(slice::from_mut(&mut msg_chunk)));
             tail.into_out().copy_from_slice(&msg_chunk[..len]);
         }
-    }
-
-    #[inline(never)]
-    fn encrypt_blocks(&mut self, mut chunks: InOutBuf<'_, '_, Array<u8, U16>>) {
-        chunked!(self, chunks, |b| self.encrypt_block(b))
     }
 
     #[inline(never)]
@@ -351,31 +353,61 @@ impl HiAeCore {
         self.fold_tag().into()
     }
 
-    #[inline(never)]
-    pub fn absorb_blocks(&mut self, mut chunks: &[Array<u8, U16>]) {
-        chunked!(self, chunks, |b| self.absorb_block(b))
-    }
-
-    #[inline(never)]
-    pub fn absorb_buf(&mut self, buf: &[u8]) {
-        let (chunks, tail) = Array::slice_as_chunks(buf);
-        self.absorb_blocks(chunks);
-        if !tail.is_empty() {
-            let len = tail.len();
-            let mut msg_chunk = [0; 16];
-            msg_chunk[..len].copy_from_slice(tail);
-            self.absorb(&msg_chunk);
-        }
-    }
-
     #[inline(always)]
     fn absorb_block(&mut self, ad: &Array<u8, U16>) {
         self.update(AesBlock::from_block(ad));
     }
 
+    // #[inline(never)]
+    // pub fn absorb_blocks2(&mut self, mut chunks: &[Array<u8, U16>]) {
+    //     chunks.iter().for_each(|b| self.absorb_block(b));
+    // }
+
+    // #[inline(never)]
+    // pub fn absorb_blocks_16(&mut self, mut chunks: &[[Array<u8, U16>; 16]]) {
+    //     self.offset = 0;
+    //     for chunks in chunks {
+    //         self.absorb_block(&chunks[0]);
+    //         self.absorb_block(&chunks[1]);
+    //         self.absorb_block(&chunks[2]);
+    //         self.absorb_block(&chunks[3]);
+    //         self.absorb_block(&chunks[4]);
+    //         self.absorb_block(&chunks[5]);
+    //         self.absorb_block(&chunks[6]);
+    //         self.absorb_block(&chunks[7]);
+    //         self.absorb_block(&chunks[8]);
+    //         self.absorb_block(&chunks[9]);
+    //         self.absorb_block(&chunks[10]);
+    //         self.absorb_block(&chunks[11]);
+    //         self.absorb_block(&chunks[12]);
+    //         self.absorb_block(&chunks[13]);
+    //         self.absorb_block(&chunks[14]);
+    //         self.absorb_block(&chunks[15]);
+    //     }
+    // }
+
+    #[inline(never)]
+    pub fn absorb_blocks(&mut self, mut chunks: &[Array<u8, U16>]) {
+        chunked!(self, chunks, |b| self.absorb_block(b))
+        // let (prefix, chunks) = chunks.split_at(chunks.len().min((16 - self.offset % 16) % 16));
+        // let (chunks, suffix) = chunks.as_chunks::<16>();
+
+        // self.absorb_blocks2(prefix);
+        // self.absorb_blocks_16(chunks);
+        // self.absorb_blocks2(suffix);
+    }
+
     #[inline(always)]
-    fn absorb(&mut self, ad: &[u8; 16]) {
-        self.update(AesBlock::from_block(ad.into()));
+    pub fn absorb_buf(&mut self, buf: &[u8]) {
+        let (chunks, tail) = Array::slice_as_chunks(buf);
+        self.absorb_blocks(chunks);
+
+        if !tail.is_empty() {
+            let len = tail.len();
+            let mut msg_chunk = Array::default();
+            msg_chunk[..len].copy_from_slice(tail);
+            self.absorb_blocks(slice::from_ref(&msg_chunk));
+        }
     }
 
     #[inline(always)]
