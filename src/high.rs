@@ -1,14 +1,14 @@
 use std::slice;
 
 use aead::{AeadCore, AeadInOut, Key, KeyInit, KeySizeUser, Nonce, inout::InOutBuf};
-use cipher::{BlockSizeUser, ParBlocksSizeUser, typenum::Unsigned};
+use cipher::{BlockSizeUser, ParBlocksSizeUser};
 use digest::{
     FixedOutput, MacMarker, OutputSizeUser, Update,
     block_buffer::{BlockBuffer, Eager},
     crypto_common::{Iv, IvSizeUser, KeyIvInit},
 };
 use hybrid_array::Array;
-use hybrid_array::sizes::{U1, U16, U32};
+use hybrid_array::sizes::{U16, U32};
 use subtle::ConstantTimeEq;
 
 use crate::mid::HiAeCore;
@@ -151,7 +151,7 @@ impl Update for HiAeMac {
             .expect("data length in bits should not overflow u64");
 
         self.blocks
-            .digest_blocks(data, |blocks| self.state.absorb_blocks(blocks));
+            .digest_blocks(data, |blocks| self.state.absorb_blocks_fast(blocks));
     }
 }
 
@@ -187,7 +187,7 @@ impl KeyIvInit for HiAeStreamCore {
     fn new(key: &Key<Self>, iv: &Iv<Self>) -> Self {
         Self {
             state: HiAeCore::new(key, iv),
-            blocks: (1u64 << 61) / <U16 as Unsigned>::U64,
+            blocks: 1u64 << 57,
         }
     }
 }
@@ -195,8 +195,12 @@ impl KeyIvInit for HiAeStreamCore {
 impl BlockSizeUser for HiAeStreamCore {
     type BlockSize = U16;
 }
+
 impl ParBlocksSizeUser for HiAeStreamCore {
-    type ParBlocksSize = U1;
+    #[cfg(feature = "small")]
+    type ParBlocksSize = hybrid_array::sizes::U1;
+    #[cfg(not(feature = "small"))]
+    type ParBlocksSize = U16;
 }
 
 impl cipher::StreamCipherCore for HiAeStreamCore {
@@ -213,9 +217,24 @@ impl cipher::StreamCipherCore for HiAeStreamCore {
 }
 
 impl cipher::StreamCipherBackend for HiAeStreamCore {
+    #[inline(always)]
+    #[cfg(not(feature = "small"))]
+    fn gen_par_ks_blocks(&mut self, blocks: &mut cipher::ParBlocks<Self>) {
+        self.blocks -= 16;
+        self.state.encrypt_empty_blocks(blocks);
+    }
+
+    #[inline(always)]
+    #[cfg(not(feature = "small"))]
+    fn gen_tail_blocks(&mut self, blocks: &mut [cipher::Block<Self>]) {
+        self.blocks -= blocks.len() as u64;
+        self.state.encrypt_empty_blocks(blocks);
+    }
+
+    #[inline(always)]
     fn gen_ks_block(&mut self, block: &mut cipher::Block<Self>) {
         self.blocks -= 1;
-        self.state.encrypt_empty_block(block);
+        self.state.encrypt_empty_blocks(slice::from_mut(block));
     }
 }
 #[cfg(test)]
