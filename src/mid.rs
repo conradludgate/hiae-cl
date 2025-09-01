@@ -79,6 +79,83 @@ macro_rules! duff16 {
     };
 }
 
+trait Buffer: Sized {
+    type Inner<'a>: Sized
+    where
+        Self: 'a;
+    fn len(&self) -> usize;
+    fn split_at(self, at: usize) -> (Self, Self);
+    fn get(&mut self, index: usize) -> Self::Inner<'_>;
+}
+
+impl<T> Buffer for &[T] {
+    type Inner<'a>
+        = &'a T
+    where
+        Self: 'a;
+
+    fn len(&self) -> usize {
+        <[T]>::len(self)
+    }
+
+    fn split_at(self, at: usize) -> (Self, Self) {
+        self.split_at(at)
+    }
+
+    fn get(&mut self, index: usize) -> &T {
+        &self[index]
+    }
+}
+
+impl<T> Buffer for InOutBuf<'_, '_, T> {
+    type Inner<'a>
+        = InOut<'a, 'a, T>
+    where
+        Self: 'a;
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn split_at(self, at: usize) -> (Self, Self) {
+        self.split_at(at)
+    }
+
+    fn get(&mut self, index: usize) -> InOut<'_, '_, T> {
+        self.get(index)
+    }
+}
+
+macro_rules! chunked {
+    ($s:expr, $chunks:expr, |$block:ident| $expr:expr) => {{
+        $s.offset %= 16;
+
+        let mut i = 16 - $s.offset;
+        while i < Buffer::len(&$chunks) {
+            let n = i;
+            let (mut batch, rest) = Buffer::split_at($chunks, i);
+
+            duff16!(i, {
+                $s.offset = 16 - i;
+                let $block = Buffer::get(&mut batch, n - i);
+                $expr;
+            });
+            $s.offset = 16 - i;
+
+            $chunks = rest;
+            i = 16;
+        }
+
+        let mut i = Buffer::len(&$chunks);
+        let mut batch = $chunks;
+        let n = i;
+        duff16!(i, {
+            let $block = Buffer::get(&mut batch, n - i);
+            $expr;
+        });
+    }};
+}
+
 impl HiAeCore {
     #[inline(always)]
     pub fn new(key: &Array<u8, U32>, iv: &Array<u8, U16>) -> Self {
@@ -161,10 +238,11 @@ impl HiAeCore {
 
         let xi = AesBlock::from_block(block.get_in());
         let t = (self[0] ^ self[1]).aes(xi);
-        *block.into_out() = (t ^ self[9]).into();
         self[0] = self[13].aes(t);
         self[3] ^= xi;
         self[13] ^= xi;
+
+        *block.into_out() = (t ^ self[9]).into();
 
         *self <<= 1;
     }
@@ -175,42 +253,17 @@ impl HiAeCore {
 
         self.encrypt_blocks(chunks);
         if !tail.is_empty() {
-            self.encrypt_partial_block(tail)
+            let len = tail.len();
+            let mut msg_chunk = Array::default();
+            msg_chunk[..len].copy_from_slice(tail.get_in());
+            self.encrypt_block(InOut::from(&mut msg_chunk));
+            tail.into_out().copy_from_slice(&msg_chunk[..len]);
         }
     }
 
     #[inline(never)]
     fn encrypt_blocks(&mut self, mut chunks: InOutBuf<'_, '_, Array<u8, U16>>) {
-        self.offset %= 16;
-
-        let mut i = 16 - self.offset;
-        while i < chunks.len() {
-            let n = i;
-            let (mut batch, rest) = chunks.split_at(i);
-
-            duff16!(i, {
-                self.offset = 16 - i;
-                self.encrypt_block(batch.get(n - i));
-            });
-            self.offset = 16 - i;
-
-            chunks = rest;
-            i = 16;
-        }
-
-        let mut i = chunks.len();
-        let mut batch = chunks;
-        let n = i;
-        duff16!(i, self.encrypt_block(batch.get(n - i)));
-    }
-
-    #[inline(always)]
-    fn encrypt_partial_block(&mut self, tail: InOutBuf<'_, '_, u8>) {
-        let len = tail.len();
-        let mut msg_chunk = Array::default();
-        msg_chunk[..len].copy_from_slice(tail.get_in());
-        self.encrypt_block(InOut::from(&mut msg_chunk));
-        tail.into_out().copy_from_slice(&msg_chunk[..len]);
+        chunked!(self, chunks, |b| self.encrypt_block(b))
     }
 
     #[inline(never)]
@@ -229,27 +282,7 @@ impl HiAeCore {
 
     #[inline(never)]
     pub fn decrypt_blocks(&mut self, mut chunks: InOutBuf<'_, '_, Array<u8, U16>>) {
-        self.offset %= 16;
-
-        let mut i = 16 - self.offset;
-        while i < chunks.len() {
-            let n = i;
-            let (mut batch, rest) = chunks.split_at(i);
-
-            duff16!(i, {
-                self.offset = 16 - i;
-                self.decrypt_block(batch.get(n - i));
-            });
-            self.offset = 16 - i;
-
-            chunks = rest;
-            i = 16;
-        }
-
-        let mut i = chunks.len();
-        let mut batch = chunks;
-        let n = i;
-        duff16!(i, self.decrypt_block(batch.get(n - i)));
+        chunked!(self, chunks, |b| self.decrypt_block(b))
     }
 
     #[inline(never)]
@@ -273,12 +306,7 @@ impl HiAeCore {
         *block.into_out() = mi.into();
     }
 
-    #[inline(never)]
-    pub fn decrypt_partial_block(
-        &mut self,
-        padded_block: InOut<'_, '_, Array<u8, U16>>,
-        len: usize,
-    ) {
+    fn decrypt_partial_block(&mut self, padded_block: InOut<'_, '_, Array<u8, U16>>, len: usize) {
         // # Step 1: Recover the keystream that would encrypt a full zero block
         // ks = AESL(S0 ^ S1) ^ ZeroPad(cn) ^ S9
         let cn = AesBlock::from_block(padded_block.get_in());
@@ -325,27 +353,7 @@ impl HiAeCore {
 
     #[inline(never)]
     pub fn absorb_blocks(&mut self, mut chunks: &[Array<u8, U16>]) {
-        self.offset %= 16;
-
-        let mut i = 16 - self.offset;
-        while i < chunks.len() {
-            let n = i;
-            let (batch, rest) = chunks.split_at(i);
-
-            duff16!(i, {
-                self.offset = 16 - i;
-                self.absorb_block(&batch[n - i]);
-            });
-            self.offset = 16 - i;
-
-            chunks = rest;
-            i = 16;
-        }
-
-        let mut i = chunks.len();
-        let batch = chunks;
-        let n = i;
-        duff16!(i, self.absorb_block(&batch[n - i]));
+        chunked!(self, chunks, |b| self.absorb_block(b))
     }
 
     #[inline(never)]
