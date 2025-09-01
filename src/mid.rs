@@ -6,6 +6,7 @@ use aead::{
     consts::{U16, U32},
     inout::InOut,
 };
+use cipher::InOutBuf;
 use hybrid_array::Array;
 
 /// * C0: an AES block built from the following bytes in hexadecimal format:
@@ -22,7 +23,7 @@ const C1: hybrid_array::Array<u8, hybrid_array::sizes::U16> = hybrid_array::Arra
 
 /// The state used by HiAE.
 pub struct HiAeCore {
-    i: usize,
+    offset: usize,
     s: [AesBlock; 16],
 }
 
@@ -38,20 +39,44 @@ impl Index<usize> for HiAeCore {
     type Output = AesBlock;
 
     fn index(&self, index: usize) -> &Self::Output {
-        &self.s[(self.i.wrapping_add(index)) % 16]
+        &self.s[(self.offset.wrapping_add(index)) % 16]
     }
 }
 
 impl IndexMut<usize> for HiAeCore {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.s[(self.i.wrapping_add(index)) % 16]
+        &mut self.s[(self.offset.wrapping_add(index)) % 16]
     }
 }
 
 impl ShlAssign<usize> for HiAeCore {
+    #[allow(clippy::suspicious_op_assign_impl)]
     fn shl_assign(&mut self, rhs: usize) {
-        self.i = self.i.wrapping_add(rhs);
+        self.offset += rhs;
     }
+}
+
+#[rustfmt::skip]
+macro_rules! duff16 {
+    ($i:ident, $body:expr) => {
+        if $i == 16 { $body; $i -= 1; }
+        if $i == 15 { $body; $i -= 1; }
+        if $i == 14 { $body; $i -= 1; }
+        if $i == 13 { $body; $i -= 1; }
+        if $i == 12 { $body; $i -= 1; }
+        if $i == 11 { $body; $i -= 1; }
+        if $i == 10 { $body; $i -= 1; }
+        if $i == 9 { $body; $i -= 1; }
+        if $i == 8 { $body; $i -= 1; }
+        if $i == 7 { $body; $i -= 1; }
+        if $i == 6 { $body; $i -= 1; }
+        if $i == 5 { $body; $i -= 1; }
+        if $i == 4 { $body; $i -= 1; }
+        if $i == 3 { $body; $i -= 1; }
+        if $i == 2 { $body; $i -= 1; }
+        if $i == 1 { $body; $i -= 1; }
+        debug_assert_eq!($i, 0);
+    };
 }
 
 impl HiAeCore {
@@ -101,7 +126,7 @@ impl HiAeCore {
             zero,
             c0 ^ c1,
         ];
-        let mut this = Self { s, i: 0 };
+        let mut this = Self { s, offset: 0 };
 
         // Diffuse(C0)
         this.diffuse(c0);
@@ -114,7 +139,7 @@ impl HiAeCore {
         this
     }
 
-    #[inline(always)]
+    #[inline(never)]
     pub fn encrypt_empty_block(&mut self, block: &mut Array<u8, U16>) {
         let t = (self[0] ^ self[1]).aesl();
         let ci = t ^ self[9];
@@ -126,7 +151,7 @@ impl HiAeCore {
     }
 
     #[inline(always)]
-    pub fn encrypt_block(&mut self, block: InOut<'_, '_, Array<u8, U16>>) {
+    fn encrypt_block(&mut self, block: InOut<'_, '_, Array<u8, U16>>) {
         // t = AESL(S0 ^ S1) ^ mi
         // ci = t ^ S9
         // S0 = AESL(S13) ^ t
@@ -136,18 +161,99 @@ impl HiAeCore {
 
         let xi = AesBlock::from_block(block.get_in());
         let t = (self[0] ^ self[1]).aes(xi);
-        let ci = t ^ self[9];
+        *block.into_out() = (t ^ self[9]).into();
         self[0] = self[13].aes(t);
         self[3] ^= xi;
         self[13] ^= xi;
 
         *self <<= 1;
+    }
 
-        *block.into_out() = ci.into();
+    #[inline(never)]
+    pub fn encrypt_buf(&mut self, buf: InOutBuf<'_, '_, u8>) {
+        let (chunks, tail) = buf.into_chunks();
+
+        self.encrypt_blocks(chunks);
+        if !tail.is_empty() {
+            self.encrypt_partial_block(tail)
+        }
+    }
+
+    #[inline(never)]
+    fn encrypt_blocks(&mut self, mut chunks: InOutBuf<'_, '_, Array<u8, U16>>) {
+        self.offset %= 16;
+
+        let mut i = 16 - self.offset;
+        while i < chunks.len() {
+            let n = i;
+            let (mut batch, rest) = chunks.split_at(i);
+
+            duff16!(i, {
+                self.offset = 16 - i;
+                self.encrypt_block(batch.get(n - i));
+            });
+            self.offset = 16 - i;
+
+            chunks = rest;
+            i = 16;
+        }
+
+        let mut i = chunks.len();
+        let mut batch = chunks;
+        let n = i;
+        duff16!(i, self.encrypt_block(batch.get(n - i)));
     }
 
     #[inline(always)]
-    pub fn decrypt_block(&mut self, block: InOut<'_, '_, Array<u8, U16>>) {
+    fn encrypt_partial_block(&mut self, tail: InOutBuf<'_, '_, u8>) {
+        let len = tail.len();
+        let mut msg_chunk = Array::default();
+        msg_chunk[..len].copy_from_slice(tail.get_in());
+        self.encrypt_block(InOut::from(&mut msg_chunk));
+        tail.into_out().copy_from_slice(&msg_chunk[..len]);
+    }
+
+    #[inline(never)]
+    pub fn decrypt_buf(&mut self, buf: InOutBuf<'_, '_, u8>) {
+        let (chunks, tail) = buf.into_chunks();
+
+        self.decrypt_blocks(chunks);
+        if !tail.is_empty() {
+            let len = tail.len();
+            let mut msg_chunk = Array::default();
+            msg_chunk[..len].copy_from_slice(tail.get_in());
+            self.decrypt_partial_block(InOut::from(&mut msg_chunk), len);
+            tail.into_out().copy_from_slice(&msg_chunk[..len]);
+        }
+    }
+
+    #[inline(never)]
+    pub fn decrypt_blocks(&mut self, mut chunks: InOutBuf<'_, '_, Array<u8, U16>>) {
+        self.offset %= 16;
+
+        let mut i = 16 - self.offset;
+        while i < chunks.len() {
+            let n = i;
+            let (mut batch, rest) = chunks.split_at(i);
+
+            duff16!(i, {
+                self.offset = 16 - i;
+                self.decrypt_block(batch.get(n - i));
+            });
+            self.offset = 16 - i;
+
+            chunks = rest;
+            i = 16;
+        }
+
+        let mut i = chunks.len();
+        let mut batch = chunks;
+        let n = i;
+        duff16!(i, self.decrypt_block(batch.get(n - i)));
+    }
+
+    #[inline(never)]
+    fn decrypt_block(&mut self, block: InOut<'_, '_, Array<u8, U16>>) {
         // t = ci ^ S9
         // mi = AESL(S0 ^ S1) ^ t
         // S0 = AESL(S13) ^ t
@@ -167,7 +273,7 @@ impl HiAeCore {
         *block.into_out() = mi.into();
     }
 
-    #[inline(always)]
+    #[inline(never)]
     pub fn decrypt_partial_block(
         &mut self,
         padded_block: InOut<'_, '_, Array<u8, U16>>,
@@ -202,7 +308,7 @@ impl HiAeCore {
         *padded_block.into_out() = mi.into();
     }
 
-    #[inline(always)]
+    #[inline(never)]
     pub fn finalize(mut self, ad_len_bits: u64, msg_len_bits: u64) -> [u8; 16] {
         // t = (LE64(ad_len_bits) || LE64(msg_len_bits))
         // Diffuse(t)
@@ -217,15 +323,58 @@ impl HiAeCore {
         self.fold_tag().into()
     }
 
+    #[inline(never)]
+    pub fn absorb_blocks(&mut self, mut chunks: &[Array<u8, U16>]) {
+        self.offset %= 16;
+
+        let mut i = 16 - self.offset;
+        while i < chunks.len() {
+            let n = i;
+            let (batch, rest) = chunks.split_at(i);
+
+            duff16!(i, {
+                self.offset = 16 - i;
+                self.absorb_block(&batch[n - i]);
+            });
+            self.offset = 16 - i;
+
+            chunks = rest;
+            i = 16;
+        }
+
+        let mut i = chunks.len();
+        let batch = chunks;
+        let n = i;
+        duff16!(i, self.absorb_block(&batch[n - i]));
+    }
+
+    #[inline(never)]
+    pub fn absorb_buf(&mut self, buf: &[u8]) {
+        let (chunks, tail) = Array::slice_as_chunks(buf);
+        self.absorb_blocks(chunks);
+        if !tail.is_empty() {
+            let len = tail.len();
+            let mut msg_chunk = [0; 16];
+            msg_chunk[..len].copy_from_slice(tail);
+            self.absorb(&msg_chunk);
+        }
+    }
+
     #[inline(always)]
-    pub fn absorb(&mut self, ad: &Array<u8, U16>) {
+    fn absorb_block(&mut self, ad: &Array<u8, U16>) {
         self.update(AesBlock::from_block(ad));
     }
 
     #[inline(always)]
+    fn absorb(&mut self, ad: &[u8; 16]) {
+        self.update(AesBlock::from_block(ad.into()));
+    }
+
+    #[inline(always)]
     fn diffuse(&mut self, xi: AesBlock) {
-        for _ in 0..32 {
-            self.update(xi);
+        for _ in 0..2 {
+            let mut i = 16;
+            duff16!(i, self.update(xi));
         }
     }
 
@@ -237,7 +386,7 @@ impl HiAeCore {
         // S13 = S13 ^ xi
         // Rol()
 
-        let t = (self[0] ^ self[1]).aesl() ^ xi;
+        let t = (self[0] ^ self[1]).aes(xi);
         self[0] = self[13].aes(t);
         self[3] ^= xi;
         self[13] ^= xi;

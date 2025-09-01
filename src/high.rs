@@ -1,15 +1,12 @@
-use aead::{
-    AeadCore, AeadInOut, Key, KeyInit, KeySizeUser, Nonce,
-    inout::{InOut, InOutBuf},
-};
+use aead::{AeadCore, AeadInOut, Key, KeyInit, KeySizeUser, Nonce, inout::InOutBuf};
 use cipher::{BlockSizeUser, ParBlocksSizeUser, typenum::Unsigned};
 use digest::{
     FixedOutput, MacMarker, OutputSizeUser, Update,
     block_buffer::{BlockBuffer, Eager},
     crypto_common::{Iv, IvSizeUser, KeyIvInit},
 };
+use hybrid_array::Array;
 use hybrid_array::sizes::{U1, U16, U32};
-use hybrid_array::{Array, ArraySize};
 use subtle::ConstantTimeEq;
 
 use crate::mid::HiAeCore;
@@ -50,27 +47,8 @@ impl AeadInOut for HiAe {
         // Init(key, nonce)
         let mut state = HiAeCore::new(&self.0, nonce);
 
-        // msg_blocks = Split(ZeroPad(msg, 128), 128)
-        // for ai in ad_blocks:
-        //     Absorb(ai)
-        process_chunks_padded(associated_data, |ad_chunk| {
-            state.absorb(ad_chunk);
-        });
-
-        // msg_blocks = Split(ZeroPad(msg, R), R)
-        // for xi in msg_blocks:
-        //     ct = ct || Enc(xi)
-        let (xt_blocks, mut xn) = buffer.into_chunks();
-        for xi in xt_blocks {
-            state.encrypt_block(xi);
-        }
-        if !xn.is_empty() {
-            let len = xn.len();
-            let mut msg_chunk = Array::default();
-            msg_chunk[..len].copy_from_slice(xn.get_in());
-            state.encrypt_block(InOut::from(&mut msg_chunk));
-            xn.get_out().copy_from_slice(&msg_chunk[..len]);
-        }
+        state.absorb_buf(associated_data);
+        state.encrypt_buf(buffer);
 
         // tag = Finalize(|ad|, |msg|)
         // ct = Truncate(ct, |msg|)
@@ -94,28 +72,8 @@ impl AeadInOut for HiAe {
         // Init(key, nonce)
         let mut state = HiAeCore::new(&self.0, nonce);
 
-        // ad_blocks = Split(ZeroPad(ad, R), R)
-        // for ai in ad_blocks:
-        //     Absorb(ai)
-        process_chunks_padded(associated_data, |ad_chunk| {
-            state.absorb(ad_chunk);
-        });
-
-        // ct_blocks = Split(ct, R)
-        // cn = Tail(ct, |ct| mod R)
-        let (ct_blocks, cn) = buffer.reborrow().into_chunks();
-
-        // for ci in ct_blocks:
-        //     msg = msg || Dec(ci)
-        for ci in ct_blocks {
-            state.decrypt_block(ci);
-        }
-
-        // if cn is not empty:
-        //     msg = msg || DecPartial(cn)
-        if !cn.is_empty() {
-            decrypt_partial(&mut state, cn);
-        }
+        state.absorb_buf(associated_data);
+        state.decrypt_buf(buffer.reborrow());
 
         // expected_tag = Finalize(|ad|, |msg|)
         let expected_tag = state.finalize(ad_len_bits, msg_len_bits);
@@ -129,32 +87,12 @@ impl AeadInOut for HiAe {
 
         if expected_tag.ct_ne(tag).into() {
             // re-encrypt the buffer to prevent revealing the plaintext.
-            self.encrypt_inout_detached(nonce, associated_data, InOutBuf::from(buffer.get_out()))
+            self.encrypt_inout_detached(nonce, associated_data, InOutBuf::from(buffer.into_out()))
                 .unwrap();
             Err(aead::Error)
         } else {
             Ok(())
         }
-    }
-}
-
-fn decrypt_partial(state: &mut HiAeCore, mut tail: InOutBuf<'_, '_, u8>) {
-    let len = tail.len();
-    let mut msg_chunk = Array::default();
-    msg_chunk[..len].copy_from_slice(tail.get_in());
-    state.decrypt_partial_block(InOut::from(&mut msg_chunk), len);
-    tail.get_out().copy_from_slice(&msg_chunk[..len]);
-}
-
-fn process_chunks_padded<T: ArraySize>(data: &[u8], mut f: impl FnMut(&Array<u8, T>)) {
-    let (chunks, tail) = Array::slice_as_chunks(data);
-    for ad_chunk in chunks {
-        f(ad_chunk);
-    }
-    if !tail.is_empty() {
-        let mut chunk = Array::default();
-        chunk[..tail.len()].copy_from_slice(tail);
-        f(&chunk);
     }
 }
 
@@ -210,9 +148,8 @@ impl Update for HiAeMac {
             .and_then(|b| self.data_len_bits.checked_add(b))
             .expect("data length in bits should not overflow u64");
 
-        self.blocks.digest_blocks(data, |blocks| {
-            blocks.iter().for_each(|block| self.state.absorb(block));
-        });
+        self.blocks
+            .digest_blocks(data, |blocks| self.state.absorb_blocks(blocks));
     }
 }
 
@@ -223,7 +160,7 @@ impl OutputSizeUser for HiAeMac {
 impl FixedOutput for HiAeMac {
     fn finalize_into(mut self, out: &mut digest::Output<Self>) {
         if self.blocks.get_pos() > 0 {
-            self.state.absorb(&self.blocks.pad_with_zeros());
+            self.state.absorb_buf(&self.blocks.pad_with_zeros());
         }
         *out = self.state.finalize(self.data_len_bits, 0).into()
     }
