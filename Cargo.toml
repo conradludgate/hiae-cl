@@ -28,6 +28,7 @@ hex-literal = "1"
 aead = { version = "0.6.0-rc.0", git = "https://github.com/RustCrypto/traits/", features = ["alloc", "os_rng"] }
 benchmark-simple = "0.1.10"
 divan = "0.1.21"
+rand_xoshiro = "0.7.0"
 
 [profile.release]
 opt-level = 3

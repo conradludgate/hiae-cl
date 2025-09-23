@@ -207,6 +207,7 @@ dependencies = [
  "divan",
  "hex-literal",
  "hybrid-array",
+ "rand_xoshiro",
  "subtle",
 ]
 
@@ -297,6 +298,15 @@ checksum = "7a509b1a2ffbe92afab0e55c8fd99dea1c280e8171bd2d88682bb20bc41cbc2c"
 dependencies = [
  "getrandom",
  "zerocopy",
+]
+
+[[package]]
+name = "rand_xoshiro"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
+dependencies = [
+ "rand_core",
 ]
 
 [[package]]
